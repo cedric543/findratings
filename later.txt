@@ -5,3 +5,5 @@ if this gets their "Sorry, we can’t find the page you’ve requested." page, t
 to look up the website https://letterboxd.com/film/<name>-<year>/
 - another thing i just saw, it can haev the same name same year and it will then go -1 at the end but i dont know how to check 
 for this yet i will think about it 
+- do it where you can use it in search if a movie has been search
+- do it normally and have it be able to tell if it is movie or not
