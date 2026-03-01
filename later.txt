@@ -3,3 +3,5 @@ changes to be made later
 - the thought is have a double checker, first just go get the year search up the normal title https://letterboxd.com/film/<name>/
 if this gets their "Sorry, we can’t find the page you’ve requested." page, then use the year that has been found 
 to look up the website https://letterboxd.com/film/<name>-<year>/
+- another thing i just saw, it can haev the same name same year and it will then go -1 at the end but i dont know how to check 
+for this yet i will think about it 
