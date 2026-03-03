@@ -210,6 +210,11 @@
 
   function hideCard() {
     if (!card) return;
+    // Fix for accessibility warning: if an element inside the card has focus, blur it before hiding.
+    if (card.contains(document.activeElement)) {
+      document.activeElement.blur();
+    }
+
     card.classList.remove("is-visible");
     card.setAttribute("aria-hidden", "true");
     activeTile = null;
@@ -226,6 +231,7 @@
     }
 
     const meta = extractTitleYear(tile);
+    // for debugging
     console.log("sending to background:", meta.title, "year:", meta.year);
     
     if (!meta?.title) {
@@ -466,11 +472,16 @@
 
     const yearFromHover = (exactNetflixYear || yearFromData) ? null : getNetflixHoverYear();
 
-    return {
+    // for debugging
+    const result = {
       title,
       // always trust the exact database year first
       year: exactNetflixYear || yearFromData || yearFromHover || parsedYear || undefined
     };
+
+    // for debugging
+    console.log('[FindRatings] Extracted metadata:', result, { tile });
+    return result;
   }
 
   function getNetflixVideoId(tile) {
@@ -493,12 +504,50 @@
   }
 
   function getNetflixYearById(videoId) {
-    if (!netflixCacheHtml) {
-      const scripts = Array.from(document.querySelectorAll('script'));
-      netflixCacheHtml = scripts.map(s => s.textContent).join(" ");
+    // Pattern 1: "videoId":123 ... "releaseYear":2020 (Standard)
+    const regex1 = new RegExp(`"videoId":${videoId}(?:(?!"videoId":)[\\s\\S])*?"releaseYear":(\\d{4})`);
+    
+    // Pattern 2: "123":{ ... "releaseYear":2020 (Falkor Cache style)
+    // Matches the ID as a key, then looks for releaseYear. 
+    // We use a negative lookahead for the start of a NEW video object ("123":{) to stop us from reading too far.
+    const regex2 = new RegExp(`"${videoId}":\\s*\\{(?:(?!"\\d+":\\s*\\{)[\\s\\S]){0,5000}["']releaseYear["']:\\s*(\\d{4})`);
+
+    // Pattern 3: Graph/Path style ["videos", 123, "releaseYear"]: 2020
+    // This is common for newer Netflix originals
+    const regex3 = new RegExp(`\\["videos",\\s*"?${videoId}"?,\\s*"releaseYear"\\]\\s*:\\s*(\\d{4})`);
+    
+    // Pattern 4: Graph/Path style with value object ["videos", 123, "releaseYear"]: { "value": 2020 }
+    const regex4 = new RegExp(`\\["videos",\\s*"?${videoId}"?,\\s*"releaseYear"\\]\\s*:\\s*\\{\\s*"value"\\s*:\\s*(\\d{4})`);
+
+    // 1. Try with existing cache first to be fast
+    if (netflixCacheHtml) {
+      let match = netflixCacheHtml.match(regex1);
+      if (match && match[1]) return match[1];
+      
+      match = netflixCacheHtml.match(regex2);
+      if (match && match[1]) return match[1];
+
+      match = netflixCacheHtml.match(regex3);
+      if (match && match[1]) return match[1];
+
+      match = netflixCacheHtml.match(regex4);
+      if (match && match[1]) return match[1];
     }
-    const regex = new RegExp(`"videoId":${videoId}[^}]*"releaseYear":(\\d{4})`);
-    const match = netflixCacheHtml.match(regex);
+
+    // 2. If not found, refresh cache (fixes infinite scroll items) and try again
+    const scripts = Array.from(document.querySelectorAll('script'));
+    netflixCacheHtml = scripts.map(s => s.textContent).join(" ");
+    
+    let match = netflixCacheHtml.match(regex1);
+    if (match && match[1]) return match[1];
+    
+    match = netflixCacheHtml.match(regex2);
+    if (match && match[1]) return match[1];
+
+    match = netflixCacheHtml.match(regex3);
+    if (match && match[1]) return match[1];
+
+    match = netflixCacheHtml.match(regex4);
     if (match && match[1]) return match[1];
     return null;
   }

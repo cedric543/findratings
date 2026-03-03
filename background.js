@@ -1,3 +1,6 @@
+// SANITY CHECK: Change this number to verify you are running the latest code
+console.log("[FindRatings] Service Worker Loaded. Version: FIXED_V16");
+
 let OMDB_API_KEY = ""; 
 
 // grabs the key your friend saved in the options page out of chrome storage
@@ -16,11 +19,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // basic security check to make sure netflix didn't accidentally send us a massive string or code
   if (message?.type === "FETCH_RATINGS") {
     if (typeof message.title !== 'string' || message.title.length > 200) {
+      // for debugging
+      console.error("[FindRatings] Invalid title received:", message.title);
       return false; 
     }
     
+    // for debugging
+    console.log("[FindRatings] Received fetch request:", { title: message.title, year: message.year });
     fetchRatings(message.title, message.year)
-      .then((data) => sendResponse({ ok: true, data }))
+      // for debugging
+      .then((data) => { console.log("[FindRatings] Sending response:", data); sendResponse({ ok: true, data }); })
       .catch((error) => {
         sendResponse({ ok: false, error: String(error) });
       });
@@ -40,13 +48,24 @@ async function fetchRatings(title, year) {
   // fix for tick tick boom. if netflix gives us no year we ask omdb for the most recent one
   // before we search letterboxd so we dont accidentally grab a random short film from 2001
   if (!rawYear || rawYear === "undefined" || rawYear === "N/A") {
+    // for debugging
+    console.log("[FindRatings] Year is missing, attempting to find it via OMDB...");
     const omdbData = await fetchOmdbBySearch(rawTitle, null, null);
     if (omdbData && omdbData.Year) {
+      // for debugging
+      console.log("[FindRatings] OMDB found year:", omdbData.Year);
       rawYear = omdbData.Year.replace(/[^\d]/g, ""); 
     }
   }
 
   let letterboxd = await fetchLetterboxd(rawTitle, rawYear);
+
+  // Fallback to TMDB if Letterboxd failed to get a rating (and user has a key)
+  // This fixes "Molly's Game" if Letterboxd scraping completely fails
+  if ((!letterboxd || letterboxd.letterboxdRating === "N/A") && TMDB_API_KEY !== "YOUR_TMDB_API_KEY") {
+    const tmdb = await fetchTmdb(rawTitle, rawYear);
+    if (tmdb) letterboxd = { ...letterboxd, ...tmdb };
+  }
 
   return {
     // we use the real title from the letterboxd page so the popup is completely accurate
@@ -89,6 +108,8 @@ async function fetchOmdb(title, year, runtime) {
 
 // if the normal omdb search fails we grab a list of matches and filter through them
 async function fetchOmdbBySearch(title, year, runtime) {
+  if (!OMDB_API_KEY) return null;
+
   const params = new URLSearchParams({
     s: title,
     type: "movie",
@@ -103,13 +124,11 @@ async function fetchOmdbBySearch(title, year, runtime) {
   let results = Array.isArray(data?.Search) ? data.Search : [];
   if (!results.length) return null;
 
-  // sorts the results by year so we get modern movies first instead of old black and white ones
-  results.sort((a, b) => parseInt(b.Year || "0") - parseInt(a.Year || "0"));
+  // Check all results returned by the page (usually 10) to ensure we don't miss the hit (fixes Moonlight)
+  const candidatesToCheck = results;
+  const detailedCandidates = [];
 
-  const desiredYear = year ? String(year) : null;
-  let best = null;
-
-  for (const item of results) {
+  for (const item of candidatesToCheck) {
     if (!item?.imdbID) continue;
     const detailParams = new URLSearchParams({
       i: item.imdbID,
@@ -119,20 +138,28 @@ async function fetchOmdbBySearch(title, year, runtime) {
     const detail = await detailResponse.json();
     if (detail?.Response !== "True") continue;
 
+    const desiredYear = year ? String(year) : null;
     const matchesYear = !desiredYear || String(detail?.Year) === desiredYear;
+    
     const runtimeMinutes = parseRuntimeMinutes(detail?.Runtime);
     const matchesRuntime = !runtime || (runtimeMinutes && isRuntimeClose(runtimeMinutes, runtime));
 
     if (matchesYear && matchesRuntime) {
-      return detail;
-    }
-
-    if (!best) {
-      best = detail;
+      detailedCandidates.push(detail);
     }
   }
 
-  return best;
+  if (!detailedCandidates.length) return null;
+
+  // If year was missing, sort by imdbVotes to find the "main" movie (fixes Moonlight/Whiplash)
+  // otherwise we might grab a random short film from 2024 just because it's newer
+  detailedCandidates.sort((a, b) => {
+    const votesA = parseInt((a.imdbVotes || "0").replace(/,/g, "")) || 0;
+    const votesB = parseInt((b.imdbVotes || "0").replace(/,/g, "")) || 0;
+    return votesB - votesA;
+  });
+
+  return detailedCandidates[0];
 }
 
 // main letterboxd hub. it tries guessing the exact url first to be fast
@@ -157,7 +184,12 @@ async function fetchLetterboxd(title, year) {
   const fromSearch = await fetchLetterboxdFromSearch(title, year);
   if (fromSearch) return fromSearch;
 
+  // If search failed, try to fetch the best guess slug one last time WITHOUT strict checking.
+  // This fixes the "link works but rating is N/A" bug.
   const fallbackSlug = variants[0];
+  const fallbackFetch = await fetchLetterboxdFilm(fallbackSlug, title, year, false);
+  if (fallbackFetch) return fallbackFetch;
+
   return {
     letterboxdRating: "N/A",
     letterboxdUrl: `https://letterboxd.com/film/${fallbackSlug}/`,
@@ -175,7 +207,8 @@ function extractLetterboxdCandidates(html) {
   const liRegex = /<li[^>]*class="[^"]*listitem[^>]*>(.*?)<\/li>/gis;
   let liMatch;
   while ((liMatch = liRegex.exec(html)) !== null) {
-      const liHtml = liMatch[1];
+      // Use [0] (full match) instead of [1] (inner content) to catch attributes on the <li> tag itself
+      const liHtml = liMatch[0];
       
       const slugMatch = liHtml.match(/data-film-slug="([^"]+)"/);
       let slug = slugMatch ? slugMatch[1].replace(/^\/film\/|\/$/g, "") : null;
@@ -189,7 +222,7 @@ function extractLetterboxdCandidates(html) {
       const year = yearMatch ? yearMatch[1] : null;
 
       const titleMatch = liHtml.match(/<span class="film-title-name">([^<]+)<\/span>/i);
-      const title = titleMatch ? titleMatch[1].trim() : slug;
+      const title = titleMatch ? decodeHtmlEntities(titleMatch[1].trim()) : slug;
 
       if (slug && !seen.has(slug)) {
           seen.add(slug);
@@ -212,14 +245,26 @@ async function fetchLetterboxdFromSearch(title, year) {
     
     const html = await response.text();
     const candidates = extractLetterboxdCandidates(html);
+    // for debugging
+    console.log(`[FindRatings] Search results for "${title}":`, candidates);
+
     if (!candidates.length) return null;
 
     // runs through the search results to find the one that matches our movie perfectly
     const selected = pickBestCandidate(candidates, title, year);
+    // for debugging
+    console.log(`[FindRatings] Selected candidate for "${title}" (${year}):`, selected);
+
     if (!selected?.slug) return null;
     
-    return fetchLetterboxdFilm(selected.slug, title, year, true);
+    // Try strict first
+    const strictResult = await fetchLetterboxdFilm(selected.slug, title, year, true);
+    if (strictResult) return strictResult;
+
+    // If strict failed but we found a candidate, try lenient (allows year mismatch)
+    return fetchLetterboxdFilm(selected.slug, title, year, false);
   } catch (e) {
+    console.error("[FindRatings] Search failed:", e);
     return null;
   }
 }
@@ -256,20 +301,45 @@ function pickBestCandidate(candidates, expectedTitle, expectedYear) {
 
 // completely regex based now so it doesnt crash the service worker
 function extractLetterboxdRating(html) {
-  const averageMatch = html.match(/<meta name="twitter:data2" content="([0-9.]+)"/i) || 
-                       html.match(/data-average-rating="([0-9.]+)"/i) ||
-                       html.match(/"ratingValue"\s*:\s*"?([0-9.]+)"?/i);
-  
-  if (averageMatch && averageMatch[1]) {
-    const num = Number(String(averageMatch[1]).trim());
-    return Number.isFinite(num) ? num.toFixed(1) : null;
+  // 1. Try to parse the JSON-LD script block. This is the most reliable method.
+  // We use a regex to grab the content inside <script type="application/ld+json">...</script>
+  const jsonLdRegex = /<script\s+type="application\/ld\+json">([\s\S]*?)<\/script>/gi;
+  let scriptMatch;
+  while ((scriptMatch = jsonLdRegex.exec(html)) !== null) {
+    try {
+      const data = JSON.parse(scriptMatch[1]);
+      const items = Array.isArray(data) ? data : [data];
+      for (const item of items) {
+        // Check for aggregateRating
+        const rating = item?.aggregateRating?.ratingValue || item?.ratingValue;
+        if (rating) return formatRating(rating);
+      }
+    } catch (e) {
+      // ignore parse errors
+    }
   }
+
+  // 2. Fallback: Try the meta tag with name (standard)
+  let match = html.match(/<meta\s+name="twitter:data2"\s+content="[^"]*?(\d+(?:\.\d+)?)/i);
+  if (match && match[1]) return formatRating(match[1]);
+
+  // 3. Fallback: JSON model (weightedAverage) - internal value
+  match = html.match(/"weightedAverage"\s*:\s*([0-9.]+)/);
+  if (match && match[1]) return formatRating(match[1]);
+
   return null;
+}
+
+function formatRating(value) {
+  const num = Number(String(value).trim());
+  return Number.isFinite(num) ? num.toFixed(1) : null;
 }
 
 // actually visits the letterboxd film url and checks if it's the movie we want
 async function fetchLetterboxdFilm(slug, expectedTitle, expectedYear, strict) {
   if (!slug) return null;
+  // for debugging
+  console.log(`[FindRatings] Attempting to fetch Letterboxd page: /film/${slug}/`);
   const filmUrl = `https://letterboxd.com/film/${slug}/`;
   try {
     const filmResponse = await fetch(filmUrl, {
@@ -277,10 +347,23 @@ async function fetchLetterboxdFilm(slug, expectedTitle, expectedYear, strict) {
     });
     if (!filmResponse.ok) return null;
     
+    // Handle redirects (e.g. surfs-up-2007 -> surfs-up)
+    const finalUrl = filmResponse.url;
+    
+    // If we got redirected to the search page, it means the slug was invalid
+    if (finalUrl.includes("/search/")) {
+      return null;
+    }
+
+    const finalSlugMatch = finalUrl.match(/letterboxd\.com\/film\/([^/?#]+)/);
+    const finalSlug = finalSlugMatch ? finalSlugMatch[1] : slug;
+
     const filmHtml = await filmResponse.text();
     
     // checks the html on the page. if the year or title is wrong we throw it out and try the next one
     if (strict && !isLetterboxdTitleMatch(filmHtml, expectedTitle, expectedYear)) {
+      // for debugging
+      console.log(`[FindRatings] Title/year mismatch for slug: ${slug}. Skipping.`);
       return null;
     }
 
@@ -288,19 +371,23 @@ async function fetchLetterboxdFilm(slug, expectedTitle, expectedYear, strict) {
     let actualTitle = expectedTitle;
     const ogTitleMatch = filmHtml.match(/<meta property="og:title" content="([^"]+)"/i);
     if (ogTitleMatch) {
-       actualTitle = ogTitleMatch[1].replace(/\s*\(\d{4}\)$/, "").trim();
+       actualTitle = decodeHtmlEntities(ogTitleMatch[1].replace(/\s*\(\d{4}\)$/, "").trim());
     }
 
     let rating = extractLetterboxdRating(filmHtml);
 
+    // for debugging
+    console.log(`[FindRatings] Success for slug: ${slug}`, { actualTitle, rating });
     return {
       letterboxdRating: rating || "N/A",
-      letterboxdUrl: filmUrl,
-      letterboxdSlug: slug,
+      letterboxdUrl: finalUrl,
+      letterboxdSlug: finalSlug,
       letterboxdSource: "letterboxd",
       letterboxdTitle: actualTitle // this is sent to the content script for display
     };
   } catch (e) {
+    // for debugging
+    console.error(`[FindRatings] Error fetching Letterboxd film for slug ${slug}:`, e);
     return null;
   }
 }
@@ -377,6 +464,8 @@ function stripLeadingArticle(value) {
 // entirely rewritten with regex because the domparser doesnt work in chrome background extensions
 function isLetterboxdTitleMatch(html, expectedTitle, expectedYear) {
   if (!expectedTitle) return true;
+  // for debugging
+  let debugInfo = { expectedTitle, expectedYear };
 
   let actualTitle = "";
   const ogTitleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i);
@@ -389,6 +478,9 @@ function isLetterboxdTitleMatch(html, expectedTitle, expectedYear) {
          actualTitle = headlineMatch[1].replace(/<[^>]+>/g, "").trim();
      }
   }
+  actualTitle = decodeHtmlEntities(actualTitle);
+  // for debugging
+  debugInfo.actualTitle = actualTitle;
 
   const normalizedExpected = normalizeTitleForCompare(expectedTitle);
   const normalizedActual = normalizeTitleForCompare(actualTitle || "");
@@ -398,24 +490,69 @@ function isLetterboxdTitleMatch(html, expectedTitle, expectedYear) {
     normalizedExpected.startsWith(normalizedActual) ||
     normalizedActual.startsWith(normalizedExpected);
 
-  if (!titleMatch) return false;
+  if (!titleMatch) {
+    // for debugging
+    console.log("[FindRatings] Title match failed:", { ...debugInfo, normalizedExpected, normalizedActual });
+    return false;
+  }
+
   if (!expectedYear) return true;
 
   // regex to scrape the exact year from the release date link on letterboxd
   let actualYear = null;
-  const releaseDateMatch = html.match(/<span class="releasedate">\s*<a[^>]*>(\d{4})<\/a>/i);
-  if (releaseDateMatch) {
-    actualYear = releaseDateMatch[1];
-  } else {
+
+  // 1. Try JSON-LD (Most reliable)
+  const jsonLdRegex = /<script\s+type="application\/ld\+json">([\s\S]*?)<\/script>/gi;
+  let scriptMatch;
+  while ((scriptMatch = jsonLdRegex.exec(html)) !== null) {
+    try {
+      const data = JSON.parse(scriptMatch[1]);
+      const items = Array.isArray(data) ? data : [data];
+      for (const item of items) {
+        if (item['@type'] === 'Movie' || item['@type'] === 'TVSeries') {
+             if (item.datePublished) {
+                 const m = String(item.datePublished).match(/\d{4}/);
+                 if (m) { actualYear = m[0]; break; }
+             }
+             if (item.releasedEvent) {
+                 const events = Array.isArray(item.releasedEvent) ? item.releasedEvent : [item.releasedEvent];
+                 for (const e of events) {
+                     if (e.startDate) {
+                         const m = String(e.startDate).match(/\d{4}/);
+                         if (m) { actualYear = m[0]; break; }
+                     }
+                 }
+             }
+        }
+      }
+    } catch (e) {}
+    if (actualYear) break;
+  }
+
+  // 2. Regex fallback (releasedate span)
+  if (!actualYear) {
+      const releaseDateMatch = html.match(/<span class="releasedate">\s*<a[^>]*>(\d{4})<\/a>/i);
+      if (releaseDateMatch) {
+        actualYear = releaseDateMatch[1];
+      }
+  }
+
+  // 3. Regex fallback (meta og:title)
+  if (!actualYear) {
     const ogYearMatch = html.match(/<meta property="og:title" content=".* \((\d{4})\)"/i);
     if (ogYearMatch) actualYear = ogYearMatch[1];
   }
+  // for debugging
+  debugInfo.actualYear = actualYear;
 
   if (!actualYear) return true; 
 
-  // allow a 1 year gap for weird distribution dates
+  // allow a 2 year gap for weird distribution dates (e.g. festival vs wide release)
   const diff = Math.abs(Number(actualYear) - Number(expectedYear));
-  return diff <= 1; 
+  // for debugging
+  const yearMatch = diff <= 2;
+  if (!yearMatch) console.log("[FindRatings] Year match failed:", debugInfo);
+  return yearMatch;
 }
 
 function normalizeTitleForCompare(title) {
@@ -753,4 +890,15 @@ async function fetchTmdb(title, year) {
     letterboxdSlug: null,
     letterboxdSource: "tmdb"
   };
+}
+
+function decodeHtmlEntities(str) {
+  if (!str) return "";
+  return str
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&#x27;/g, "'");
 }
