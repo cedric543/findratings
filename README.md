@@ -1,5 +1,4 @@
 # findratings
-# findratings
 
 A Chrome extension that displays Letterboxd ratings in real-time hover popups while browsing movies on Netflix and Disney+.
 
