@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>findratings — top picks</title>
+  <style>
+    body { padding: 30px; font-family: "Sora", "IBM Plex Sans", "Segoe UI", sans-serif; background: #0f1117; color: #f5f7ff; }
+    .card { max-width: 700px; padding: 20px; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; background: #111318; }
+    h2 { margin: 0 0 4px; font-size: 18px; }
+    .hint { font-size: 12px; color: #aaa; margin: 0 0 20px; }
+    .hint a { color: #00e054; text-decoration: none; }
+    .hint a:hover { text-decoration: underline; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.07); font-size: 13px; }
+    th { color: #aaa; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+    td a { color: #00e054; text-decoration: none; }
+    td a:hover { text-decoration: underline; }
+    #empty-msg { font-size: 13px; color: #aaa; margin-top: 12px; }
+    #films-table { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>top picks</h2>
+    <p class="hint">films you've browsed on netflix, sorted by letterboxd rating. <a href="options.html" target="_blank">settings ↗</a></p>
+    <table id="films-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>title</th>
+          <th>year</th>
+          <th>rating</th>
+        </tr>
+      </thead>
+      <tbody id="films-body"></tbody>
+    </table>
+    <p id="empty-msg">no films seen yet. browse netflix to populate this list.</p>
+  </div>
+  <script src="recommendations.js"></script>
+</body>
+</html>
