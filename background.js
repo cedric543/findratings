@@ -15,6 +15,9 @@ chrome.storage.onChanged.addListener((changes) => {
 
 const TMDB_API_KEY = "YOUR_TMDB_API_KEY";
 
+// in-memory cache so hovering the same movie twice is instant
+const ratingsCache = new Map();
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // basic security check to make sure netflix didn't accidentally send us a massive string or code
   if (message?.type === "FETCH_RATINGS") {
@@ -42,6 +45,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function fetchRatings(title, year) {
+  const cacheKey = `${String(title).trim()}::${String(year || "").trim()}`;
+  if (ratingsCache.has(cacheKey)) {
+    return ratingsCache.get(cacheKey);
+  }
+
   const rawTitle = title;
   let rawYear = year;
 
@@ -54,7 +62,11 @@ async function fetchRatings(title, year) {
     if (omdbData) {
       console.log("[FindRatings] OMDB data:", { year: omdbData.Year, runtime: omdbData.Runtime });
       if (omdbData.Year) {
-        omdbYear = omdbData.Year.replace(/[^\d]/g, "").slice(0, 4);
+        const parsedYear = omdbData.Year.replace(/[^\d]/g, "").slice(0, 4);
+        // ignore future years — they're unreleased stubs and will point to the wrong page
+        if (parsedYear && Number(parsedYear) <= new Date().getFullYear()) {
+          omdbYear = parsedYear;
+        }
       }
       if (omdbData.Runtime) {
         omdbRuntime = parseRuntimeMinutes(omdbData.Runtime);
@@ -77,15 +89,17 @@ async function fetchRatings(title, year) {
     if (tmdb) letterboxd = { ...letterboxd, ...tmdb };
   }
 
-  return {
+  const result = {
     // we use the real title from the letterboxd page so the popup is completely accurate
     title: letterboxd?.letterboxdTitle || rawTitle,
-    year: rawYear,
+    year: rawYear || letterboxd?.letterboxdYear || null,
     letterboxdRating: letterboxd?.letterboxdRating || "N/A",
     letterboxdUrl: letterboxd?.letterboxdUrl || null,
     letterboxdSlug: letterboxd?.letterboxdSlug || null,
     letterboxdSource: letterboxd?.letterboxdSource || null
   };
+  ratingsCache.set(cacheKey, result);
+  return result;
 }
 
 // asks omdb for extra data just in case we need to verify a run time
@@ -101,6 +115,11 @@ async function fetchOmdb(title, year, runtime) {
   if (year) {
     params.set("y", String(year));
   }
+
+  // when no year is given, skip the direct lookup — it defaults to the most recent film
+  // which is wrong for titles like "Snake Eyes" where the old film is what Netflix has.
+  // go straight to search-by-votes which reliably picks the most well-known version.
+  if (!year) return fetchOmdbBySearch(title, null, runtime);
 
   const response = await fetch(`https://www.omdbapi.com/?${params.toString()}`);
   const data = await response.json();
@@ -134,30 +153,26 @@ async function fetchOmdbBySearch(title, year, runtime) {
   let results = Array.isArray(data?.Search) ? data.Search : [];
   if (!results.length) return null;
 
-  // Check all results returned by the page (usually 10) to ensure we don't miss the hit (fixes Moonlight)
-  const candidatesToCheck = results;
-  const detailedCandidates = [];
-
-  for (const item of candidatesToCheck) {
-    if (!item?.imdbID) continue;
-    const detailParams = new URLSearchParams({
-      i: item.imdbID,
-      apikey: OMDB_API_KEY
-    });
-    const detailResponse = await fetch(`https://www.omdbapi.com/?${detailParams.toString()}`);
-    const detail = await detailResponse.json();
-    if (detail?.Response !== "True") continue;
-
-    const desiredYear = year ? String(year) : null;
-    const matchesYear = !desiredYear || String(detail?.Year) === desiredYear;
-    
-    const runtimeMinutes = parseRuntimeMinutes(detail?.Runtime);
-    const matchesRuntime = !runtime || (runtimeMinutes && isRuntimeClose(runtimeMinutes, runtime));
-
-    if (matchesYear && matchesRuntime) {
-      detailedCandidates.push(detail);
-    }
-  }
+  // fetch all candidate details in parallel
+  const desiredYear = year ? String(year) : null;
+  const detailedCandidates = (await Promise.all(
+    results
+      .filter(item => item?.imdbID)
+      .map(async item => {
+        try {
+          const detailParams = new URLSearchParams({ i: item.imdbID, apikey: OMDB_API_KEY });
+          const detailResponse = await fetch(`https://www.omdbapi.com/?${detailParams.toString()}`);
+          const detail = await detailResponse.json();
+          if (detail?.Response !== "True") return null;
+          // exclude TV series and TV episodes — Netflix movies shouldn't match these
+          if (!desiredYear && detail?.Type && detail.Type !== "movie") return null;
+          const matchesYear = !desiredYear || String(detail?.Year) === desiredYear;
+          const runtimeMinutes = parseRuntimeMinutes(detail?.Runtime);
+          const matchesRuntime = !runtime || (runtimeMinutes && isRuntimeClose(runtimeMinutes, runtime));
+          return (matchesYear && matchesRuntime) ? detail : null;
+        } catch { return null; }
+      })
+  )).filter(Boolean);
 
   if (!detailedCandidates.length) return null;
 
@@ -177,18 +192,31 @@ async function fetchOmdbBySearch(title, year, runtime) {
 // this fixes films like War Machine (2017) where Netflix doesn't expose the year.
 async function fetchLetterboxdRecentYears(title, omdbRuntime) {
   const slug = slugifyLetterboxdTitle(title);
-  if (!slug) return null;
+  // also generate a slug that drops "&" entirely instead of converting to "and"
+  // e.g. "Mr. & Mrs. Smith" → "mr-mrs-smith" not "mr-and-mrs-smith"
+  const slugNoAnd = title.includes("&")
+    ? slugifyLetterboxdTitle(title.replace(/\s*&\s*/g, " "))
+    : null;
+
+  const slugsToTry = [...new Set([slug, slugNoAnd].filter(Boolean))];
+  if (!slugsToTry.length) return null;
+
   const currentYear = new Date().getFullYear();
-  for (let y = currentYear; y >= currentYear - 12; y--) {
-    const yearSlug = `${slug}-${y}`;
-    const result = await fetchLetterboxdFilmRaw(yearSlug, title, String(y), omdbRuntime, false);
-    // only accept if the page exists AND has a real rating — skip N/A stubs
-    if (result && result.letterboxdRating !== "N/A") {
-      console.log(`[FindRatings] Year guess found: ${yearSlug} (${y})`);
-      return result;
-    }
-  }
-  return null;
+  const years = Array.from({ length: 30 }, (_, i) => currentYear - i);
+
+  // fire all year+slug combinations in parallel, then pick the newest with a real rating
+  const results = await Promise.all(
+    years.flatMap(y =>
+      slugsToTry.map(s =>
+        fetchLetterboxdFilmRaw(`${s}-${y}`, title, String(y), omdbRuntime, false)
+          .then(r => (r && r.letterboxdRating !== "N/A" ? { ...r, _year: y } : null))
+          .catch(() => null)
+      )
+    )
+  );
+
+  // return the result with the highest (most recent) year
+  return results.filter(Boolean).sort((a, b) => b._year - a._year)[0] || null;
 }
 
 // main letterboxd hub. it tries guessing the exact url first to be fast
@@ -196,12 +224,17 @@ async function fetchLetterboxdRecentYears(title, omdbRuntime) {
 // omdbRuntime is in minutes and is used to disambiguate films with the same title and year
 async function fetchLetterboxd(title, year, omdbRuntime) {
   if (!year || year === "undefined" || year === "N/A") {
-    const fromSearch = await fetchLetterboxdFromSearch(title, year, omdbRuntime);
-    if (fromSearch) return fromSearch;
-    // search failed — try year-suffixed slugs for recent years before falling
-    // through to the generic slug which might be a wrong old film with N/A
-    const fromYearGuess = await fetchLetterboxdRecentYears(title, omdbRuntime);
+    // run search and recent-year slug guessing in parallel
+    const [fromSearch, fromYearGuess] = await Promise.all([
+      fetchLetterboxdFromSearch(title, null, omdbRuntime).catch(() => null),
+      fetchLetterboxdRecentYears(title, omdbRuntime).catch(() => null)
+    ]);
+    // prefer the year-guess result if it has a real rating — it's more specific than a
+    // popularity-ranked search result which could be a remake or TV series
+    if (fromYearGuess && fromYearGuess.letterboxdRating !== "N/A") return fromYearGuess;
+    if (fromSearch && fromSearch.letterboxdRating !== "N/A") return fromSearch;
     if (fromYearGuess) return fromYearGuess;
+    if (fromSearch) return fromSearch;
   }
 
   const variants = buildLetterboxdSlugVariants(title, year);
@@ -209,17 +242,22 @@ async function fetchLetterboxd(title, year, omdbRuntime) {
     return null;
   }
 
-  for (const slug of variants) {
-    const resolved = await fetchLetterboxdFilm(slug, title, year, omdbRuntime, true);
-    if (resolved) return resolved;
-  }
+  // try all slug variants in parallel — first valid result wins
+  const slugResults = await Promise.all(
+    variants.map(slug => fetchLetterboxdFilm(slug, title, year, omdbRuntime, true).catch(() => null))
+  );
+  // when we have a year, take the first match; without a year prefer a result with a real rating
+  // to avoid landing on an old obscure film (e.g. 1941 Mr. & Mrs. Smith) over the Netflix one
+  const resolved = year
+    ? slugResults.find(r => r !== null) || null
+    : slugResults.find(r => r && r.letterboxdRating !== "N/A") || slugResults.find(r => r !== null) || null;
+  if (resolved) return resolved;
 
   // fallback to search if the url guessing failed for some reason
   const fromSearch = await fetchLetterboxdFromSearch(title, year, omdbRuntime);
   if (fromSearch) return fromSearch;
 
-  // If search failed, try to fetch the best guess slug one last time WITHOUT strict checking.
-  // This fixes the "link works but rating is N/A" bug.
+  // If search failed, try the best guess slug one last time WITHOUT strict checking.
   const fallbackSlug = variants[0];
   const fallbackFetch = await fetchLetterboxdFilm(fallbackSlug, title, year, omdbRuntime, false);
   if (fallbackFetch) return fallbackFetch;
@@ -318,6 +356,19 @@ async function fetchLetterboxdFromSearch(title, year, omdbRuntime) {
     const strictResult = await fetchLetterboxdFilm(selected.slug, title, year, omdbRuntime, true);
     if (strictResult) return strictResult;
 
+    // If strict failed and we have no year, try the next few candidates in parallel
+    // — the top search result is often a newer remake/series, not the film Netflix has
+    if (!year) {
+      const remaining = candidates.filter(c => c.slug !== selected.slug).slice(0, 3);
+      if (remaining.length) {
+        const fallbacks = await Promise.all(
+          remaining.map(c => fetchLetterboxdFilm(c.slug, title, year, omdbRuntime, true).catch(() => null))
+        );
+        const hit = fallbacks.find(r => r && r.letterboxdRating !== "N/A");
+        if (hit) return hit;
+      }
+    }
+
     // If strict failed but we found a candidate, try lenient (allows year mismatch)
     return fetchLetterboxdFilm(selected.slug, title, year, omdbRuntime, false);
   } catch (e) {
@@ -330,6 +381,12 @@ async function fetchLetterboxdFromSearch(title, year, omdbRuntime) {
 // this guarantees we grab the modern lin-manuel miranda movie instead of the short film
 function pickBestCandidate(candidates, expectedTitle, expectedYear) {
   if (!candidates.length) return null;
+
+  const currentYear = new Date().getFullYear();
+
+  // filter out future-year stubs unless we explicitly want that year
+  const filtered = candidates.filter(c => !c.year || Number(c.year) <= currentYear || String(c.year) === String(expectedYear));
+  if (filtered.length) candidates = filtered;
 
   if (expectedTitle) {
       const normExpected = normalizeTitleForCompare(expectedTitle);
@@ -434,13 +491,15 @@ async function fetchLetterboxdFilm(slug, expectedTitle, expectedYear, omdbRuntim
       console.log(`[FindRatings] Runtime check for ${slug}: OMDB=${omdbRuntime}min LB=${lbRuntime}min`);
       if (lbRuntime && !isRuntimeClose(lbRuntime, omdbRuntime)) {
         console.log(`[FindRatings] Runtime mismatch for ${slug}. Trying numbered disambiguation.`);
-        // Try slug-1, slug-2 ... slug-5 (letterboxd uses these for same-name same-year films)
+        // Try slug-1 through slug-5 in parallel (letterboxd uses these for same-name same-year films)
         const baseForNumbered = expectedYear ? `${slug.replace(/-\d+$/, "")}-${expectedYear}` : slug.replace(/-\d+$/, "");
-        for (let i = 1; i <= 5; i++) {
-          const numberedSlug = `${baseForNumbered}-${i}`;
-          const numbered = await fetchLetterboxdFilmRaw(numberedSlug, expectedTitle, expectedYear, omdbRuntime, strict);
-          if (numbered) return numbered;
-        }
+        const numberedResults = await Promise.all(
+          [1,2,3,4,5].map(i =>
+            fetchLetterboxdFilmRaw(`${baseForNumbered}-${i}`, expectedTitle, expectedYear, omdbRuntime, strict).catch(() => null)
+          )
+        );
+        const numberedMatch = numberedResults.find(r => r !== null);
+        if (numberedMatch) return numberedMatch;
         // no numbered variant matched runtime — return null so caller can try other slug variants
         return null;
       }
@@ -560,6 +619,16 @@ function buildLetterboxdSlugVariants(title, year) {
   add(stripLeadingArticle(base));
   add(stripLeadingArticle(stripSubtitle(base)));
 
+  // letterboxd sometimes drops "&" entirely instead of converting to "and"
+  // e.g. "The Death & Life of..." → "the-death-life-of-..." not "the-death-and-life-of-..."
+  if (base.includes("&")) {
+    const dropAmpersand = base.replace(/\s*&\s*/g, " ");
+    add(dropAmpersand);
+    add(stripSubtitle(dropAmpersand));
+    add(stripLeadingArticle(dropAmpersand));
+    add(stripLeadingArticle(stripSubtitle(dropAmpersand)));
+  }
+
   variants = [...new Set(variants)];
 
   // adds the -year suffix and puts them at the front of the line so we check exact remakes first
@@ -579,7 +648,8 @@ function buildLetterboxdSlugVariants(title, year) {
 const LETTERBOXD_TITLE_OVERRIDES = {
   "war dogs": ["war-dogs-2016"],
   "gladiator": ["gladiator-2000"],
-  "tick tick boom": ["tick-tick-boom-2021"]
+  "tick tick boom": ["tick-tick-boom-2021"],
+  "break up": ["the-break-up"]
 };
 
 function stripSubtitle(value) {
@@ -620,10 +690,16 @@ function isLetterboxdTitleMatch(html, expectedTitle, expectedYear, strict = true
   const normalizedExpected = normalizeTitleForCompare(expectedTitle);
   const normalizedActual = normalizeTitleForCompare(actualTitle || "");
 
+  // word-boundary prefix check: handles subtitle stripping ("Inception: The Story" vs "Inception")
+  // but blocks short-word false matches ("break" must not match "break up")
+  // the shorter side must account for at least 2 words OR be a full single-word exact match
+  const expectedWords = normalizedExpected.split(" ");
+  const actualWords = normalizedActual.split(" ");
+  const wordsMatch = (shorter, longer) => shorter.length >= 2 && shorter.every((w, i) => w === longer[i]);
   const titleMatch =
     normalizedExpected === normalizedActual ||
-    normalizedExpected.startsWith(normalizedActual) ||
-    normalizedActual.startsWith(normalizedExpected);
+    (expectedWords.length <= actualWords.length && wordsMatch(expectedWords, actualWords)) ||
+    (actualWords.length < expectedWords.length && wordsMatch(actualWords, expectedWords));
 
   if (!titleMatch) {
     // in lenient mode, skip title check — maybe LB uses a slightly different title
