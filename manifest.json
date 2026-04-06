@@ -1,11 +1,9 @@
 {
   "manifest_version": 3,
   "name": "findratings",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "letterboxd ratings for netflix",
   "permissions": [
-    "activeTab",
-    "scripting",
     "storage"
   ],
   "content_security_policy": {
@@ -16,8 +14,7 @@
     "open_in_tab": true
   },
   "host_permissions": [
-    "*://*.netflix.com/browse/genre/*",
-    "*://*.disneyplus.com/browse/*",
+    "*://*.netflix.com/*",
     "https://www.omdbapi.com/*",
     "https://letterboxd.com/*",
     "https://api.themoviedb.org/*"
@@ -28,9 +25,8 @@
   },
   "content_scripts": [
     {
-      "matches": [ 
-        "*://*.netflix.com/*",
-        "*://*.disneyplus.com/*"
+      "matches": [
+        "*://*.netflix.com/*"
       ],
       "js": [
         "content.js"
